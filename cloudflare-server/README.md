@@ -82,6 +82,9 @@ The API server entry is what makes the client use `wss://` instead of `ws://`. D
 are not in WebSocket mode cannot reach this server at all: Workers accept HTTP and WebSocket
 only, not RustDesk's raw TCP/UDP ports.
 
+For a printable setup sheet, put your domain and public key at the top of
+`scripts/client-setup-pdf.mjs` and run `node scripts/client-setup-pdf.mjs`.
+
 For a custom client build, set the same options: `custom-rendezvous-server`, `api-server`,
 `key` and `allow-websocket=Y` (plus `relay-server` if you want it fixed).
 

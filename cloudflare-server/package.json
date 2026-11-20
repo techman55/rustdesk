@@ -16,6 +16,7 @@
     "@cloudflare/workers-types": "5.20261104.1",
     "@types/node": "26.6.6",
     "@types/ws": "8.18.2",
+    "pdfkit": "0.20.2",
     "protobufjs": "8.8.1",
     "typescript": "7.0.2",
     "vite": "8.3.5",
