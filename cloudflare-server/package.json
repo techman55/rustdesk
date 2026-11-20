@@ -1,0 +1,26 @@
+{
+  "name": "rustdesk-cloudflare-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RustDesk rendezvous + relay server for Cloudflare Workers and Durable Objects (WebSocket transport, E2EE-capable)",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "genkey": "node scripts/genkey.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261104.1",
+    "@types/node": "26.6.6",
+    "@types/ws": "8.18.2",
+    "protobufjs": "8.8.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "vitest": "5.1.0",
+    "wrangler": "4.158.0",
+    "ws": "8.22.1"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rustdesk-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+
+  // Serve the Worker on your own hostname; clients need a real domain for wss://.
+  // "routes": [{ "pattern": "rd.example.com", "custom_domain": true }],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "REGISTRY", "class_name": "Registry" },
+      { "name": "RELAY", "class_name": "Relay" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Registry", "Relay"] }],
+
+  "vars": {
+    "REQUIRE_KEY": "true"
+    // "RELAY_SERVER": "rd.example.com",
+    // "RELAY_HOST_TEMPLATE": "{token}.relay.example.com",
+    // "HEARTBEAT_SECONDS": "40"
+  }
+  // PRIVATE_KEY is a secret: `npx wrangler secret put PRIVATE_KEY`
+}
