@@ -37,6 +37,16 @@ const MAX_NOTIFY_ATTEMPTS = 5;
 const RATE_WINDOW_MS = 10 * MINUTE;
 const RATE_MAX = 20;
 const DEFAULT_RETENTION_DAYS = 90;
+// One "blocked client" alert per client and device in this window, however often it retries.
+const BLOCKED_ALERT_WINDOW_MS = 10 * MINUTE;
+
+// The device retries an audit post, and holds back its later ones, unless the answer is a
+// 2xx with an empty body (post_audit_async in src/server/connection.rs).
+const delivered = () => new Response(null, { status: 200 });
+
+function log(event: string, fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ event, ...fields }));
+}
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS device_info (
@@ -252,6 +262,12 @@ export class Monitor {
     await this.sendPending();
   }
 
+  // When a requested end becomes overdue and the relay should be closed as well.
+  nextDue(): number | undefined {
+    const r = this.one("SELECT MIN(at) AS at FROM disconnects WHERE relay_closed = 0");
+    return r?.at === null || r?.at === undefined ? undefined : Number(r.at) + RELAY_FALLBACK_MS + 1000;
+  }
+
   hasPendingWork(now = Date.now()): boolean {
     return !!this.one(
       `SELECT 1 FROM events WHERE (closed_at IS NULL AND authorized_at IS NULL
@@ -301,14 +317,21 @@ export class Monitor {
     if (this.relayOffUntil(now)) return conns.length ? { disconnect: conns } : {};
 
     const disconnect: number[] = [];
-    for (const d of this.all("SELECT conn_id, at FROM disconnects WHERE device_id = ?", id)) {
+    for (const d of this.all(
+      "SELECT conn_id, at, relay_closed FROM disconnects WHERE device_id = ?",
+      id,
+    )) {
       const connId = Number(d.conn_id);
       if (conns.includes(connId)) {
         disconnect.push(connId);
+        if (!d.relay_closed && now - Number(d.at) > RELAY_FALLBACK_MS) {
+          await this.closeEventRelay(id, connId);
+        }
       } else if (now - Number(d.at) > DISCONNECT_GRACE_MS) {
         this.sql.exec("DELETE FROM disconnects WHERE device_id = ? AND conn_id = ?", id, connId);
       }
     }
+    if (disconnect.length) log("disconnect_sent", { device: id, conns, disconnect });
     return disconnect.length ? { disconnect } : {};
   }
 
@@ -333,9 +356,15 @@ export class Monitor {
     if (!this.deviceOk(device, body.uuid)) return new Response("Forbidden", { status: 403 });
     const connId = int(body.conn_id);
     if (connId === null) return new Response("Bad request", { status: 400 });
-    if (!this.firstTime(body.nonce)) return new Response("OK");
+    if (!this.firstTime(body.nonce)) return delivered();
     const now = Date.now();
 
+    log("audit_conn", {
+      device,
+      conn: connId,
+      action: body.action ?? (Array.isArray(body.peer) ? "login" : "other"),
+      peer: Array.isArray(body.peer) ? body.peer[0] : undefined,
+    });
     if (body.action === "new") {
       this.openEvent(device, connId, normIp(body.ip), origin, now);
     } else if (body.action === "close") {
@@ -363,13 +392,21 @@ export class Monitor {
       const ev = this.event(String(e.id))!;
       if (peerId && this.one("SELECT 1 FROM blocked_ids WHERE peer_id = ?", peerId)) {
         this.requestEnd(ev, "The client's ID is blocked");
-        this.want(ev, "blocked");
+        await this.closeEventRelay(device, connId);
+        const alerted = this.one(
+          `SELECT 1 FROM events WHERE peer_id = ? AND device_id = ? AND notify_kind = 'blocked'
+           AND notified_at > ?`,
+          peerId,
+          device,
+          now - BLOCKED_ALERT_WINDOW_MS,
+        );
+        if (!alerted) this.want(ev, "blocked");
       } else if (!(peerId && this.isTrusted(peerId, device))) {
         this.want(ev, "started");
       }
     }
     await this.sendPending();
-    return new Response("OK");
+    return delivered();
   }
 
   private async auditAlarm(body: Record<string, unknown>, origin: string): Promise<Response> {
@@ -378,7 +415,7 @@ export class Monitor {
     const connId = int(body.conn_id);
     const typ = int(body.typ);
     if (connId === null || typ === null) return new Response("Bad request", { status: 400 });
-    if (!this.firstTime(body.nonce)) return new Response("OK");
+    if (!this.firstTime(body.nonce)) return delivered();
     let info: Record<string, unknown> = {};
     try {
       info = typeof body.info === "string" ? JSON.parse(body.info) : {};
@@ -399,7 +436,7 @@ export class Monitor {
     );
     this.want(this.event(String(e.id))!, "alarm");
     await this.sendPending();
-    return new Response("OK");
+    return delivered();
   }
 
   private openEvent(device: string, connId: number, ip: string, origin: string, now: number): Row {
@@ -520,7 +557,9 @@ export class Monitor {
         "UPDATE events SET notified_at = 0, notify_attempts = notify_attempts + 1 WHERE id = ?",
         e.id,
       );
+      const started = Date.now();
       const ok = await sendPushover(this.env, this.notice(e));
+      log("pushover", { kind: e.notify_kind, device: e.device_id, ok, ms: Date.now() - started });
       this.sql.exec("UPDATE events SET notified_at = ? WHERE id = ?", ok ? Date.now() : null, e.id);
     }
   }
@@ -562,17 +601,21 @@ export class Monitor {
       connId,
     );
     const e = this.findEvent(device, connId, Date.now());
-    if (e?.relay_uuid) await this.closeRelay(e.relay_host as string | null, String(e.relay_uuid));
+    if (e?.relay_uuid) {
+      await this.closeRelay(e.relay_host as string | null, String(e.relay_uuid));
+    } else {
+      log("relay_close_skipped", { device, conn: connId, reason: "session relay unknown" });
+    }
   }
 
   private async closeRelay(host: string | null, uuid: string | null): Promise<void> {
     const name = host ? relayObjectName(host, this.env.RELAY_HOST_TEMPLATE) : "hub";
     const stub = this.env.RELAY.get(this.env.RELAY.idFromName(name));
     try {
-      if (uuid) await stub.closeSession(uuid);
-      else await stub.closeAll();
-    } catch {
-      // the relay object may be gone already; devices drop their sessions via heartbeat
+      const closed = uuid ? await stub.closeSession(uuid) : await stub.closeAll();
+      log("relay_closed", { relay: name, uuid, sockets: closed });
+    } catch (e) {
+      log("relay_close_failed", { relay: name, uuid, error: String(e) });
     }
   }
 
@@ -651,6 +694,7 @@ export class Monitor {
         if (peer) {
           this.sql.exec("INSERT OR IGNORE INTO blocked_ids (peer_id, at) VALUES (?, ?)", peer, now);
           this.requestEnd(e, "The client's ID is blocked");
+          if (e.closed_at === null) await this.closeEventRelay(String(e.device_id), Number(e.conn_id));
         }
         break;
       case "unblock_id":
@@ -660,6 +704,7 @@ export class Monitor {
         if (ip) {
           this.sql.exec("INSERT OR IGNORE INTO blocked_ips (ip, at) VALUES (?, ?)", ip, now);
           this.requestEnd(e, "The client's IP address is blocked");
+          if (e.closed_at === null) await this.closeEventRelay(String(e.device_id), Number(e.conn_id));
         }
         break;
       case "unblock_ip":

@@ -106,6 +106,7 @@ export class Registry extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       const res = await this.monitor.http(request);
       await this.ensureAlarm();
+      await this.wakeBy(this.monitor.nextDue());
       return res;
     }
     const ip = formatIp(
@@ -196,7 +197,13 @@ export class Registry extends DurableObject<Env> {
     }
     await this.monitor.tick(now);
     this.alarmSet = open > 0 || this.monitor.hasPendingWork();
-    if (this.alarmSet) await this.ctx.storage.setAlarm(now + hb);
+    if (this.alarmSet) await this.ctx.storage.setAlarm(Math.min(now + hb, this.monitor.nextDue() ?? Infinity));
+  }
+
+  private async wakeBy(due: number | undefined): Promise<void> {
+    if (due === undefined) return;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > due) await this.ctx.storage.setAlarm(due);
   }
 
   async relayAllowed(ip: string): Promise<boolean> {

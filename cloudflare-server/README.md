@@ -164,6 +164,10 @@ How it works and what it cannot do:
   Cloudflare Access in front of `/admin/*` adds a login; RustDesk clients never use that path.
 - Alert text and links go through Pushover's servers.
 
+To watch what happens while you test (device reports, disconnects sent, relay sessions
+closed, Pushover deliveries), run `npx wrangler tail` or open the Worker's logs in the
+Cloudflare dashboard.
+
 ## Known limits
 
 - **Every session is relayed.** WebSocket mode has no peer-to-peer path, so all traffic flows

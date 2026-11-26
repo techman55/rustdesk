@@ -112,14 +112,21 @@ export class Relay extends DurableObject<Env> {
     this.teardown(ws, 1011, "peer error");
   }
 
-  closeSession(uuid: string): void {
+  closeSession(uuid: string): number {
+    let n = 0;
     for (const ws of this.ctx.getWebSockets()) {
-      if (attachment(ws)?.uuid === uuid) this.teardown(ws, 1000, "ended by the administrator");
+      if (attachment(ws)?.uuid === uuid) {
+        this.teardown(ws, 1000, "ended by the administrator");
+        n++;
+      }
     }
+    return n;
   }
 
-  closeAll(): void {
-    for (const ws of this.ctx.getWebSockets()) this.teardown(ws, 1000, "relay turned off");
+  closeAll(): number {
+    const sockets = this.ctx.getWebSockets();
+    for (const ws of sockets) this.teardown(ws, 1000, "relay turned off");
+    return sockets.length;
   }
 
   private onRequest(ws: WebSocket, message: ArrayBuffer | string): void {

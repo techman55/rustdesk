@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newKey, Peer, startServer, type Server } from "./harness";
@@ -145,8 +145,14 @@ describe("connection alerts and admin actions", () => {
   it("alerts at high priority on an attempt that never logs in", async () => {
     await request("700000002");
     const id = ++conn;
-    await report("700000002", id, { action: "new", ip: "127.0.0.1" });
-    await report("700000002", id, { action: "close" });
+    // Anything but an empty body makes the device retry the report and hold back the next.
+    for (const r of [
+      await report("700000002", id, { action: "new", ip: "127.0.0.1" }),
+      await report("700000002", id, { action: "close" }),
+    ]) {
+      expect(r.status).toBe(200);
+      expect(await r.text()).toBe("");
+    }
     const p = await nextPush();
     expect(p.title).toBe("RustDesk: login attempt failed");
     expect(p.priority).toBe("1");
@@ -193,6 +199,42 @@ describe("connection alerts and admin actions", () => {
     const again = await session("700000002", "800000003", "mallory");
     expect((await nextPush()).title).toBe("RustDesk: remote desktop session started");
     expect(await heartbeat("700000002", [again])).toEqual({});
+  });
+
+  it("cuts a blocked client's relayed session as soon as it logs in", async () => {
+    const device = "700000002";
+    await session(device, "800000009", "intruder");
+    const first = await nextPush();
+    await act(first.url, "block_id");
+
+    const ctl = await Peer.connect(`${server.ws}/ws/id`);
+    ctl.send({ punch_hole_request: { id: device, licence_key: key.publicKey, version: VERSION } });
+    const ph = (await devices[device].peer.next()).punch_hole;
+    const uuid = randomUUID();
+    const answer = await Peer.connect(`${server.ws}/ws/id`);
+    answer.send({
+      relay_response: { socket_addr: ph.socket_addr, uuid, relay_server: ph.relay_server, id: device, version: VERSION },
+    });
+    await ctl.next();
+    const a = await Peer.connect(`${server.ws}/ws/relay`);
+    a.send({ request_relay: { licence_key: key.publicKey, uuid } });
+    const b = await Peer.connect(`${server.ws}/ws/relay`);
+    b.send({ request_relay: { licence_key: key.publicKey, uuid } });
+    a.sendRaw(Buffer.from("screen"));
+    await b.frame();
+
+    const id = ++conn;
+    await report(device, id, { action: "new", ip: "127.0.0.1" });
+    await report(device, id, { peer: ["800000009", "intruder"], type: 0 });
+    await a.waitClosed(3000);
+    await b.waitClosed(3000);
+    expect((await nextPush()).title).toBe("RustDesk: blocked client disconnected");
+
+    // Its client reconnecting does not repeat the alert.
+    await session(device, "800000009", "intruder");
+    await noPush();
+    await act(first.url, "unblock_id");
+    for (const p of [ctl, answer]) p.close();
   });
 
   it("pauses new connections to one device without affecting others", async () => {
