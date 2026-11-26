@@ -77,7 +77,12 @@ const SCHEMA = [
     device_id TEXT NOT NULL, conn_id INTEGER NOT NULL, at INTEGER NOT NULL,
     relay_closed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (device_id, conn_id))`,
   `CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, at INTEGER NOT NULL)`,
+  // source is "id:<client id>" or "ip:<address>"
+  `CREATE TABLE IF NOT EXISTS silenced (
+    kind TEXT NOT NULL, source TEXT NOT NULL, until INTEGER NOT NULL, PRIMARY KEY (kind, source))`,
 ];
+
+const ALERT_KINDS = ["started", "blocked", "failed", "pending", "alarm"];
 
 export const ACTIONS = [
   "trust",
@@ -91,6 +96,8 @@ export const ACTIONS = [
   "unpause",
   "relay_off",
   "relay_on",
+  "silence",
+  "unsilence",
 ] as const;
 type Action = (typeof ACTIONS)[number];
 
@@ -256,6 +263,7 @@ export class Monitor {
     this.sql.exec("DELETE FROM nonces WHERE at < ?", now - 10 * MINUTE);
     this.sql.exec("DELETE FROM paused WHERE until < ?", now);
     this.sql.exec("DELETE FROM flags WHERE until < ?", now);
+    this.sql.exec("DELETE FROM silenced WHERE until < ?", now);
     const days = Number(this.env.EVENT_RETENTION_DAYS);
     const keep = (Number.isFinite(days) && days > 0 ? days : DEFAULT_RETENTION_DAYS) * DAY;
     this.sql.exec("DELETE FROM events WHERE opened_at < ?", now - keep);
@@ -524,12 +532,17 @@ export class Monitor {
     if (prev && (!login || prev === "started" || prev === "blocked" || prev === "suppressed")) {
       return;
     }
+    if (this.isSilenced(kind, e)) {
+      this.sql.exec("UPDATE events SET notify_kind = 'silenced', notified_at = ? WHERE id = ?", Date.now(), e.id);
+      return;
+    }
     if (!login && this.trustedAttempt(e)) {
       this.sql.exec("UPDATE events SET notify_kind = 'trusted', notified_at = ? WHERE id = ?", Date.now(), e.id);
       return;
     }
     const recent = this.one(
-      "SELECT COUNT(*) AS n FROM events WHERE device_id = ? AND notified_at > ? AND notify_kind != 'trusted'",
+      `SELECT COUNT(*) AS n FROM events WHERE device_id = ? AND notified_at > ?
+       AND notify_kind NOT IN ('trusted', 'silenced', 'suppressed')`,
       e.device_id,
       Date.now() - RATE_WINDOW_MS,
     );
@@ -541,6 +554,26 @@ export class Monitor {
       "UPDATE events SET notify_kind = ?, notified_at = NULL, notify_attempts = 0 WHERE id = ?",
       kind,
       e.id,
+    );
+  }
+
+  // The client ID when the alert knows it, otherwise its IP address.
+  private silenceSource(e: Row): string | undefined {
+    if (e.peer_id) return `id:${e.peer_id}`;
+    if (e.ip) return `ip:${e.ip}`;
+    return undefined;
+  }
+
+  // A silence set from an alert that knew the client ID also covers its later attempts that
+  // only carry the address, and the other way round.
+  private isSilenced(kind: string, e: Row): boolean {
+    const sources = [e.peer_id ? `id:${e.peer_id}` : "", e.ip ? `ip:${e.ip}` : ""].filter(Boolean);
+    if (!sources.length) return false;
+    return !!this.one(
+      `SELECT 1 FROM silenced WHERE kind = ? AND until > ? AND source IN (${sources.map(() => "?").join(", ")})`,
+      kind,
+      Date.now(),
+      ...sources,
     );
   }
 
@@ -730,6 +763,23 @@ export class Monitor {
       case "relay_on":
         this.sql.exec("DELETE FROM flags WHERE name = 'relay_off'");
         break;
+      case "silence":
+      case "unsilence": {
+        const kind = e.notify_kind as string | null;
+        const source = this.silenceSource(e);
+        if (!kind || !ALERT_KINDS.includes(kind) || !source) break;
+        if (action === "silence") {
+          this.sql.exec(
+            "INSERT OR REPLACE INTO silenced (kind, source, until) VALUES (?, ?, ?)",
+            kind,
+            source,
+            now + BLOCK_MS,
+          );
+        } else {
+          this.sql.exec("DELETE FROM silenced WHERE kind = ? AND source = ?", kind, source);
+        }
+        break;
+      }
     }
   }
 
@@ -773,6 +823,34 @@ export class Monitor {
       ).map((r) => String(r.id));
     }
     const paused = this.one("SELECT until FROM paused WHERE device_id = ? AND until > ?", device, now);
+    const blockedId = !!peer && !!this.one("SELECT 1 FROM blocked_ids WHERE peer_id = ?", peer);
+    const blockedIp = !!ip && !!this.one("SELECT 1 FROM blocked_ips WHERE ip = ?", ip);
+    const relayOffUntil = this.relayOffUntil(now);
+    const kind = e.notify_kind as string | null;
+    const source = this.silenceSource(e);
+    let silence: EventView["silence"];
+    if (kind && ALERT_KINDS.includes(kind) && source) {
+      const row = this.one(
+        "SELECT until FROM silenced WHERE kind = ? AND source = ? AND until > ?",
+        kind,
+        source,
+        now,
+      );
+      // Offered once something has been done about this client or device; a failed attempt
+      // from an address a blocked client ID has used counts too.
+      const acted =
+        e.end_requested_at !== null ||
+        blockedId ||
+        blockedIp ||
+        !!paused ||
+        !!relayOffUntil ||
+        (!!ip &&
+          !!this.one(
+            "SELECT 1 FROM events e JOIN blocked_ids b ON b.peer_id = e.peer_id WHERE e.ip = ? LIMIT 1",
+            ip,
+          ));
+      silence = { kind, source, until: row ? Number(row.until) : undefined, available: acted };
+    }
     return {
       id: String(e.id),
       token: String(e.token),
@@ -791,10 +869,11 @@ export class Monitor {
       relayHost: (e.relay_host as string | null) ?? undefined,
       notifyKind: (e.notify_kind as string | null) ?? undefined,
       trusted: !!peer && this.isTrusted(peer, device),
-      blockedId: !!peer && !!this.one("SELECT 1 FROM blocked_ids WHERE peer_id = ?", peer),
-      blockedIp: !!ip && !!this.one("SELECT 1 FROM blocked_ips WHERE ip = ?", ip),
+      blockedId,
+      blockedIp,
       pausedUntil: paused ? Number(paused.until) : undefined,
-      relayOffUntil: this.relayOffUntil(now),
+      relayOffUntil,
+      silence,
     };
   }
 

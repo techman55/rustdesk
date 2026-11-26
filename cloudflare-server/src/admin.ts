@@ -41,6 +41,8 @@ export interface EventView {
   blockedIp: boolean;
   pausedUntil?: number;
   relayOffUntil?: number;
+  // kind is the alert this event sent; source is "id:<client id>" or "ip:<address>"
+  silence?: { kind: string; source: string; until?: number; available: boolean };
   done?: string;
 }
 
@@ -57,6 +59,13 @@ const PRIMARY_AUTH: Record<number, string> = {
   2: "one-time password",
   3: "permanent password",
   4: "switch sides",
+};
+const ALERT_NAMES: Record<string, string> = {
+  started: "session started",
+  blocked: "blocked client disconnected",
+  failed: "login attempt failed",
+  pending: "login attempt in progress",
+  alarm: "security alert",
 };
 const TWO_FACTOR: Record<number, string> = { 1: "2FA code", 2: "trusted device" };
 const ALARMS: Record<number, string> = {
@@ -210,7 +219,22 @@ const DONE: Record<string, string> = {
   unpause: "Connections to this device resumed.",
   relay_off: "Relay turned off for 24 hours.",
   relay_on: "Relay turned back on.",
+  silence: "These alerts are silenced for 24 hours.",
+  unsilence: "These alerts are back on.",
 };
+
+function silenceAction(v: EventView): string {
+  const s = v.silence;
+  if (!s || (!s.available && !s.until)) return "";
+  const [type, value] = [s.source.slice(0, 2) === "id" ? "ID" : "IP", s.source.slice(3)];
+  return action(
+    `Silence "${ALERT_NAMES[s.kind] ?? s.kind}" alerts from ${type} ${value}`,
+    s.until
+      ? `Silenced until ${when(s.until, v.now)}. Attempts are still recorded, and blocks stay in force.`
+      : "For 24 hours. Attempts are still recorded, and blocks stay in force.",
+    button(v, s.until ? "unsilence" : "silence", s.until ? "Unsilence" : "Silence 24 h"),
+  );
+}
 
 export function renderEvent(v: EventView): string {
   const now = v.now;
@@ -262,6 +286,7 @@ export function renderEvent(v: EventView): string {
           : `End this session and refuse new connections from ${c.ip}.`,
       c.ip ? button(v, v.blockedIp ? "unblock_ip" : "block_ip", v.blockedIp ? "Unblock IP" : "Block IP") : "",
     ),
+    silenceAction(v),
     action(
       `Pause new connections to ${label(v.device)}`,
       v.pausedUntil

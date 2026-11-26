@@ -237,6 +237,41 @@ describe("connection alerts and admin actions", () => {
     for (const p of [ctl, answer]) p.close();
   });
 
+  it("silences one alert type from a blocked client's address for 24 hours, until undone", async () => {
+    const device = "700000002";
+    const attempt = async () => {
+      const id = ++conn;
+      await report(device, id, { action: "new", ip: "127.0.0.1" });
+      await report(device, id, { action: "close" });
+    };
+    // Before anything is done about this address, there is nothing to silence.
+    await attempt();
+    const before = await nextPush();
+    expect(await (await fetch(before.url)).text()).not.toContain("Silence 24 h");
+
+    await session(device, "800000010", "attacker");
+    const attacker = (await nextPush()).url;
+    await act(attacker, "block_id");
+    await attempt();
+    const failed = await nextPush();
+    expect(failed.title).toBe("RustDesk: login attempt failed");
+    expect(await (await fetch(failed.url)).text()).toContain("Silence 24 h");
+    await act(failed.url, "silence");
+
+    await attempt();
+    await attempt();
+    await noPush();
+    // Other alert types, and other devices, still come through.
+    await session(device, "800000011", "colleague");
+    expect((await nextPush()).title).toBe("RustDesk: remote desktop session started");
+
+    expect(await (await fetch(failed.url)).text()).toContain("Unsilence");
+    await act(failed.url, "unsilence");
+    await attempt();
+    expect((await nextPush()).title).toBe("RustDesk: login attempt failed");
+    await act(attacker, "unblock_id");
+  });
+
   it("pauses new connections to one device without affecting others", async () => {
     await act(link, "pause");
     expect((await request("700000001")).refused.other_failure).toBe(

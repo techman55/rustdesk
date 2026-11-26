@@ -150,6 +150,9 @@ undo:
 - **Pause new connections to this device for 24 hours.** Other devices keep working.
 - **Turn off the whole relay for 24 hours:** ends every session and refuses new ones,
   including yours. The page itself keeps working, so you can turn it back on.
+- **Silence these alerts for 24 hours:** stops this alert type from this client ID (or, when
+  the ID is unknown, its IP address). Offered once you have acted on that client or device,
+  for example blocked it. Attempts are still recorded and blocks stay in force.
 
 How it works and what it cannot do:
 
