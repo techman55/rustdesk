@@ -14,6 +14,11 @@ export interface Env {
   // Durable Object. Needs a wildcard DNS record and route for that pattern.
   RELAY_HOST_TEMPLATE?: string;
   HEARTBEAT_SECONDS?: string;
+  // Secrets: connection alerts go to Pushover when both are set.
+  PUSHOVER_APP_TOKEN?: string;
+  PUSHOVER_USER_KEY?: string;
+  PUSHOVER_API_URL?: string;
+  EVENT_RETENTION_DAYS?: string;
 }
 
 export function requireKey(env: Env): boolean {

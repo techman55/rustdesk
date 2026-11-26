@@ -61,7 +61,10 @@ export async function startServer(vars: Record<string, string>): Promise<Server>
     "warn",
   ];
   for (const [k, v] of Object.entries(vars)) args.push("--var", `${k}:${v}`);
-  const child: ChildProcess = spawn("npx", args, { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] });
+  // Outbound requests from the Worker go to local test servers, never through a proxy.
+  const env = { ...process.env };
+  for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) delete env[k];
+  const child: ChildProcess = spawn("npx", args, { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   child.stdout!.on("data", (d) => (output += d));
   child.stderr!.on("data", (d) => (output += d));
@@ -70,8 +73,8 @@ export async function startServer(vars: Record<string, string>): Promise<Server>
   for (;;) {
     if (child.exitCode !== null) throw new Error(`wrangler dev exited:\n${output}`);
     try {
-      const r = await fetch(`${http}/api/heartbeat`, { method: "POST" });
-      if (r.ok) break;
+      await fetch(`${http}/`);
+      break;
     } catch {
       // not listening yet
     }

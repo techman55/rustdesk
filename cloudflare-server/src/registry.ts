@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { addrKey, demangle, formatIp, mangle, parseIp, type SockAddr } from "./addr";
 import { requireKey, sendableCloseCode, type Env } from "./env";
+import { Monitor, normIp } from "./monitor";
 import { Msg, PbError, PunchFailure, RegisterPkResult, RM, unwrap, wrap } from "./pb";
 import { loadSigner, type Signer } from "./sign";
 
@@ -15,6 +16,7 @@ interface Att {
   id?: string; // set once this socket registered as a device
   reg?: number;
   want?: string; // the peer this controller connection asked for
+  g?: string; // Cloudflare's location data for the client, as JSON
 }
 
 interface PeerRow {
@@ -77,6 +79,7 @@ export class Registry extends DurableObject<Env> {
   private lastSeen = new Map<WebSocket, number>();
   private regRate = new Map<string, { n: number; t: number }>();
   private alarmSet = false;
+  private monitor: Monitor;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -88,6 +91,7 @@ export class Registry extends DurableObject<Env> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )`);
+    this.monitor = new Monitor(ctx.storage.sql, env, (id) => this.devices.has(id));
     const now = Date.now();
     for (const ws of ctx.getWebSockets()) {
       const a = attachment(ws);
@@ -99,6 +103,11 @@ export class Registry extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      const res = await this.monitor.http(request);
+      await this.ensureAlarm();
+      return res;
+    }
     const ip = formatIp(
       parseIp(request.headers.get("CF-Connecting-IP") ?? "") ?? new Uint8Array([127, 0, 0, 1]),
     );
@@ -106,6 +115,8 @@ export class Registry extends DurableObject<Env> {
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server);
     const a: Att = { ip, port, host: new URL(request.url).hostname, t: Date.now() };
+    const geo = request.headers.get("X-RD-Geo");
+    if (geo && geo.length <= 512) a.g = geo;
     server.serializeAttachment(a);
     this.byAddr.set(keyOf(a), server);
     this.lastSeen.set(server, a.t);
@@ -183,8 +194,13 @@ export class Registry extends DurableObject<Env> {
       }
       open++;
     }
-    this.alarmSet = open > 0;
+    await this.monitor.tick(now);
+    this.alarmSet = open > 0 || this.monitor.hasPendingWork();
     if (this.alarmSet) await this.ctx.storage.setAlarm(now + hb);
+  }
+
+  async relayAllowed(ip: string): Promise<boolean> {
+    return this.monitor.relayAllowed(normIp(ip));
   }
 
   private heartbeatMs(): number {
@@ -298,6 +314,7 @@ export class Registry extends DurableObject<Env> {
     a.reg = now;
     ws.serializeAttachment(a);
     this.bindDevice(id, ws, now);
+    this.monitor.deviceOnline(id, a.ip, a.g);
     reply(RegisterPkResult.OK, Math.ceil((2 * this.heartbeatMs()) / 1000));
   }
 
@@ -347,12 +364,15 @@ export class Registry extends DurableObject<Env> {
       const signer = await this.signer();
       if (m.str(3).trim() !== signer.publicKeyB64) return fail(PunchFailure.LICENSE_MISMATCH);
     }
+    const denied = this.monitor.denyReason(id, a.ip);
+    if (denied) return send(ws, RM.PunchHoleResponse, new Msg().setStr(7, denied));
     const target = this.devices.get(id);
     if (!target) {
       return fail(this.peerRow(id) ? PunchFailure.OFFLINE : PunchFailure.ID_NOT_EXIST);
     }
     a.want = id;
     ws.serializeAttachment(a);
+    this.monitor.recordRequest({ target: id, ip: a.ip, geo: a.g, version: m.str(6) });
     // In WebSocket mode the controlled side always answers through a relay, with a
     // RelayResponse that onRelayResponse routes back here.
     const ph = new Msg()
@@ -367,6 +387,8 @@ export class Registry extends DurableObject<Env> {
   private onRequestRelay(ws: WebSocket, a: Att, m: Msg): void {
     if (!RELAY_UUID.test(m.str(2))) return;
     const id = m.str(1);
+    const denied = this.monitor.denyReason(id, a.ip);
+    if (denied) return send(ws, RM.RelayResponse, new Msg().setStr(6, denied));
     const target = this.devices.get(id);
     if (!target) {
       send(ws, RM.RelayResponse, new Msg().setStr(6, "Remote desktop is offline"));
@@ -374,6 +396,7 @@ export class Registry extends DurableObject<Env> {
     }
     a.want = id;
     ws.serializeAttachment(a);
+    this.monitor.recordRequest({ target: id, ip: a.ip, geo: a.g, relayHost: m.str(4), uuid: m.str(2) });
     m.setBytes(3, mangle(sockAddr(a)));
     send(target, RM.RequestRelay, m);
   }
@@ -389,6 +412,7 @@ export class Registry extends DurableObject<Env> {
     if (m.has(4)) {
       const id = m.str(4);
       if (ca?.want !== id) return;
+      this.monitor.recordRequest({ target: id, ip: ca.ip, geo: ca.g, relayHost: m.str(3), uuid });
       const row = this.peerRow(id);
       const pk =
         row && m.str(7) ? await (await this.signer()).signIdPk(id, row.pk) : new Uint8Array(0);

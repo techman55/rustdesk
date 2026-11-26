@@ -243,7 +243,11 @@ describe("rendezvous + relay over WebSocket", () => {
   it("serves only the API the client needs", async () => {
     const hb = await fetch(`${server.http}/api/heartbeat`, { method: "POST", body: "{}" });
     expect(await hb.json()).toEqual({});
-    expect((await fetch(`${server.http}/api/sysinfo`, { method: "POST" })).status).toBe(404);
+    const sys = await fetch(`${server.http}/api/sysinfo`, { method: "POST", body: "{}" });
+    expect(sys.status).toBe(200);
+    // SYSINFO_UPDATED would switch on the client's Pro features.
+    expect(await sys.text()).not.toBe("SYSINFO_UPDATED");
+    expect((await fetch(`${server.http}/api/login`, { method: "POST" })).status).toBe(404);
     expect((await fetch(`${server.http}/ws/id`)).status).toBe(426);
   });
 });

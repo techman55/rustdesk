@@ -97,6 +97,8 @@ For a custom client build, set the same options: `custom-rendezvous-server`, `ap
 | `RELAY_SERVER` | host the client used | relay address handed to peers in hub mode |
 | `RELAY_HOST_TEMPLATE` | unset | e.g. `{token}.relay.example.com`; see below |
 | `HEARTBEAT_SECONDS` | `40` | how often idle devices are pinged; clients drop the connection after 3 missed pings |
+| `PUSHOVER_APP_TOKEN`, `PUSHOVER_USER_KEY` (secrets) | unset | turn on [connection alerts](#connection-alerts) |
+| `EVENT_RETENTION_DAYS` | `90` | how long connection records are kept |
 
 ### Scaling the relay
 
@@ -115,17 +117,64 @@ its own relay Durable Object, placed near the first peer to connect:
    Relay server setting over the one the server offers, so a set value sends every session to
    the hub.
 
+## Connection alerts
+
+With Pushover set up, you get a notification every time someone logs in to one of your
+devices, and a high-priority one when an attempt never logs in (wrong password, rejected or
+cancelled) or trips the device's brute-force protection. Every session type alerts: remote
+desktop, file transfer, port forward, terminal and camera.
+
+1. Create an application at [pushover.net](https://pushover.net) and copy its API token, and
+   copy your user key from the Pushover dashboard.
+2. Store both:
+
+   ```bash
+   npx wrangler secret put PUSHOVER_APP_TOKEN
+   ```
+
+   ```bash
+   npx wrangler secret put PUSHOVER_USER_KEY
+   ```
+
+Each alert links to a page with the client's ID and name, IP address, location and network
+(as Cloudflare sees them), both devices' names, OS and versions, when each registered and
+last checked in, and how the client logged in. Its buttons, each of which the same page can
+undo:
+
+- **Trust this pair:** no more alerts for this client and device, including failed attempts
+  from the address that client uses.
+- **End this session:** the device drops it within a few seconds and tells the client not to
+  reconnect.
+- **Block this client's ID:** its sessions are ended right after it logs in.
+- **Block this client's IP address:** connections from it are refused before they start.
+- **Pause new connections to this device for 24 hours.** Other devices keep working.
+- **Turn off the whole relay for 24 hours:** ends every session and refuses new ones,
+  including yours. The page itself keeps working, so you can turn it back on.
+
+How it works and what it cannot do:
+
+- The facts about logins come from the device being accessed, which reports each connection
+  to its API server (the `https://` address in its settings). The server never sees
+  passwords; they travel inside the encrypted session.
+- **A client's ID is known only once it logs in.** RustDesk sends it inside the encrypted
+  login, so a failed attempt shows the IP address and location, plus a guess when that
+  address matches one of your devices. For the same reason a blocked ID gets to try a
+  password; block its IP address to stop it earlier.
+- **Anyone with an alert's link can use its buttons.** Keep the links to yourself. Putting
+  Cloudflare Access in front of `/admin/*` adds a login; RustDesk clients never use that path.
+- Alert text and links go through Pushover's servers.
+
 ## Known limits
 
 - **Every session is relayed.** WebSocket mode has no peer-to-peer path, so all traffic flows
   through Cloudflare, and latency depends on where the relay Durable Object sits.
 - **Deploying drops live sessions** and device connections. Clients reconnect on their own.
-- **No RustDesk Server Pro features:** accounts, address book sync, device groups, strategies,
-  audit logs. The API answers the client's heartbeat and nothing else, so the client keeps
-  those features hidden.
-- **No bandwidth limits or IP blocking** (hbbs's IP blocker is not ported). With
-  `REQUIRE_KEY` on, only holders of the Key can open sessions, but anyone can register an ID,
-  as with hbbs.
+- **No RustDesk Server Pro features:** accounts, address book sync, device groups and
+  strategies. The API takes the client's heartbeats, system info and connection reports, but
+  never answers in a way that turns on the client's Pro features.
+- **No bandwidth limits or automatic IP blocking** (hbbs's IP blocker is not ported; you can
+  block addresses from an alert). With `REQUIRE_KEY` on, only holders of the Key can open
+  sessions, but anyone can register an ID, as with hbbs.
 - **No backpressure on the relay.** A peer that reads much slower than the other sends can
   make the relay object buffer until Cloudflare resets it. RustDesk's own frame pacing keeps
   this rare.
@@ -140,8 +189,9 @@ Workers have no egress charges. Durable Objects bill compute time and messages:
 - An active relayed session keeps its relay object awake, roughly **$0.006–0.01 per
   session-hour** on the Paid plan (128 MB × wall time, plus incoming messages at 20:1).
 - Each device posts `/api/heartbeat` every 15 seconds while idle (every 3 seconds while it is
-  being controlled): about 5,800 Worker requests a day per idle device. On the Free plan
-  (100,000 requests a day) that alone caps you at about 15 devices.
+  being controlled): about 5,800 Worker requests a day per idle device, each also a registry
+  Durable Object request. On the Free plan (100,000 requests a day) that alone caps you at
+  about 15 devices; on the Paid plan it is about $0.03 a month per device.
 
 Check current pricing before relying on these numbers.
 
